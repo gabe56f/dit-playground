@@ -1,0 +1,6 @@
+checkpoints/**
+data/**
+__pycache__
+wandb/**
+config.json
+no_dec_16kbps_44khz.safetensors
