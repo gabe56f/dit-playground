@@ -81,6 +81,7 @@ class FourierPositionEmbedding(nn.Module):
         return self.apply_fourier_pos_emb(x)
 
 
+# arXiv:2502.07864
 class MultiheadLatentAttention(nn.Module):
     def __init__(
         self,
@@ -88,11 +89,18 @@ class MultiheadLatentAttention(nn.Module):
         n_heads: int,
         n_kv_heads: int,
         latent_dim_rank: int,
+        bias: bool = False,
         use_fourier_embedding: bool = True,
         context_len: int = None,
         fourier_terms: int = 4,
         fourier_sigma: float = 0.1,
         dropout: float = 0.0,
+        softcap: float = 20.0,
+        softmax_scale: float = None,
+        # arXiv:2501.19399
+        learn_softmax: bool = True,
+        softmax_bias: bool = False,
+        softmax_scale_init: float = 0.43,
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -104,11 +112,15 @@ class MultiheadLatentAttention(nn.Module):
         self.d_head = d_model // n_heads
         ratio = n_heads // n_kv_heads
 
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-        self.w_kv_compress = nn.Linear(d_model, 2 * latent_dim_rank, bias=False)
-        self.w_k_decompress = nn.Linear(latent_dim_rank, d_model // ratio, bias=False)
-        self.w_v_decompress = nn.Linear(latent_dim_rank, d_model // ratio, bias=False)
-        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        self.w_q = nn.Linear(d_model, d_model, bias=bias)
+
+        latent_dim_rank = latent_dim_rank * 2
+        self.w_kv_compress = nn.Linear(d_model, latent_dim_rank, bias=bias)
+        self.w_kv_decompress = nn.Linear(
+            latent_dim_rank, 2 * (d_model // ratio), bias=bias
+        )
+
+        self.w_o = nn.Linear(d_model, d_model, bias=bias)
 
         if use_fourier_embedding:
             self.emb = FourierPositionEmbedding(
@@ -120,36 +132,68 @@ class MultiheadLatentAttention(nn.Module):
         else:
             self.emb = nn.Identity()
         self.dropout = nn.Dropout(dropout)
+        self.softcap = softcap
 
-    def forward(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(self.d_head)
+
+        if learn_softmax:
+            self.softmax_scale = nn.Parameter(
+                torch.full((self.n_heads,), softmax_scale_init)
+            )
+            if softmax_bias:
+                self.softmax_bias = nn.Parameter(torch.full((self.n_heads,), 0.0))
+
+        self.scale = softmax_scale
+        self.learn_softmax = learn_softmax
+        self.softmax_has_bias = softmax_bias
+
+    def forward(self, query: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         # value is ignored 'cause we don't use it
         B, L_q, _ = query.shape
-        _, L_k, _ = key.shape
+        _, L_k, _ = kv.shape
 
         q = self.w_q(query)
-        kv_input = key
+        kv_input = kv
         latent_kv = self.w_kv_compress(kv_input)
-        latent_k, latent_v = latent_kv.chunk(2, dim=-1)
-        k = self.w_k_decompress(latent_k)
-        v = self.w_v_decompress(latent_v)
+        k, v = self.w_kv_decompress(latent_kv).chunk(2, dim=-1)
 
         q = q.view(B, L_q, self.n_heads, self.d_head).transpose(1, 2)
         k = k.view(B, L_k, self.n_kv_heads, self.d_head).transpose(1, 2)
         v = v.view(B, L_k, self.n_kv_heads, self.d_head).transpose(1, 2)
 
-        q = self.emb(q)
+        q: torch.Tensor = self.emb(q)
         k = self.emb(k)
 
+        if self.learn_softmax:
+            dtype = q.dtype
+            n_val = torch.tensor(L_q, dtype=dtype, device=q.device)
+            log_n = torch.log(n_val)
+
+            scale_per_head = self.softmax_scale.view(1, self.n_heads, 1, 1)
+            scale_per_head = scale_per_head * log_n
+
+            if self.softmax_has_bias:
+                bias_per_head = self.softmax_bias.view(1, self.n_heads, 1, 1)
+                scale_per_head = scale_per_head + bias_per_head
+
+            q = q * scale_per_head
+
         output = flash_attn_func(
-            q, k, v, dropout_p=self.dropout.p if self.training else 0.0
+            q,
+            k,
+            v,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            # Attention in gemma2 was trained using a softcap of 20, which improved
+            # long range dependencies in attention, so might as well have this in here,
+            # given its minimal performance cost.
+            softcap=self.softcap,
+            # arXiv:2501.19399
+            # Scaling softmax with a learnable scale (according to the paper mentioned above)
+            # improves performance in long sequences. Long sequences are all we have, so this
+            # is generally a good thing to have, right?
+            softmax_scale=self.scale,
         )
 
-        # output = sageattn(q, k, v)
-
-        # output = F.scaled_dot_product_attention(
-        #     q, k, v, dropout_p=self.dropout.p if self.training else 0.0
-        # )
         output = output.transpose(1, 2).contiguous().view(B, L_q, -1)
-        return self.w_o(output), None
+        return self.w_o(output)

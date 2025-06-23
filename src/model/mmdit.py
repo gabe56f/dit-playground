@@ -4,6 +4,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+from torch.nn.modules.normalization import RMSNorm
 
 from .mla import MultiheadLatentAttention
 
@@ -31,8 +32,8 @@ class SwiGLUMlp(nn.Module):
 
         # arXiv:2409.12517
         if use_smooth_swiglu:
-            self.gate_norm = nn.LayerNorm(
-                hidden_features, elementwise_affine=False, eps=1e-6
+            self.gate_norm = RMSNorm(
+                hidden_features, eps=1e-8, elementwise_affine=False
             )
         else:
             self.gate_norm = nn.Identity()
@@ -90,58 +91,69 @@ class MMDitBlock(nn.Module):
         n_kv_heads: int,
         mlp_ratio: float = 4.0,
         attn_dropout: float = 0.1,
+        softcap: float = 20.0,
+        learn_softmax: bool = True,
+        softmax_bias: bool = False,
+        softmax_scale_init: float = 0.43,
         context_len: int = 1024,
         use_fourier_embedding: bool = True,
         fourier_terms: int = 4,
         fourier_sigma: float = 0.1,
-        use_mla: bool = True,
         mla_dim_rank: int = None,
         use_smooth_swiglu: bool = False,
+        scale_rmsnorm: bool = False,
         act: Literal["swish", "gelu", "gelu-approx"] = "swish",
+        eps: float = 1e-8,
     ):
         super().__init__()
-        self.self_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        self.cross_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        self.ffn_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.self_norm = RMSNorm(
+            d_model,
+            eps=eps,
+            elementwise_affine=scale_rmsnorm,
+        )
+        self.cross_norm = RMSNorm(
+            d_model,
+            eps=eps,
+            elementwise_affine=scale_rmsnorm,
+        )
+        self.ffn_norm = RMSNorm(
+            d_model,
+            eps=eps,
+            elementwise_affine=scale_rmsnorm,
+        )
 
-        if use_mla:
-            self.self_attention = MultiheadLatentAttention(
-                d_model,
-                n_heads,
-                n_kv_heads,
-                use_fourier_embedding=use_fourier_embedding,
-                context_len=context_len,
-                fourier_terms=fourier_terms,
-                fourier_sigma=fourier_sigma,
-                latent_dim_rank=mla_dim_rank,
-                dropout=attn_dropout,
-            )
-            self.cross_attention = MultiheadLatentAttention(
-                d_model,
-                n_heads,
-                n_kv_heads,
-                use_fourier_embedding=use_fourier_embedding,
-                context_len=context_len,
-                fourier_terms=fourier_terms,
-                fourier_sigma=fourier_sigma,
-                latent_dim_rank=mla_dim_rank,
-                dropout=attn_dropout,
-            )
-        else:
-            self.self_attention = nn.MultiheadAttention(
-                d_model,
-                n_heads,
-                batch_first=True,
-                need_weights=False,
-                dropout=attn_dropout,
-            )
-            self.cross_attention = nn.MultiheadAttention(
-                d_model,
-                n_heads,
-                batch_first=True,
-                need_weights=False,
-                dropout=attn_dropout,
-            )
+        self.self_attention = MultiheadLatentAttention(
+            d_model,
+            n_heads,
+            n_kv_heads,
+            bias=False,
+            use_fourier_embedding=use_fourier_embedding,
+            context_len=context_len,
+            fourier_terms=fourier_terms,
+            fourier_sigma=fourier_sigma,
+            latent_dim_rank=mla_dim_rank,
+            dropout=attn_dropout,
+            softcap=softcap,
+            learn_softmax=learn_softmax,
+            softmax_bias=softmax_bias,
+            softmax_scale_init=softmax_scale_init,
+        )
+        self.cross_attention = MultiheadLatentAttention(
+            d_model,
+            n_heads,
+            n_kv_heads,
+            bias=False,
+            use_fourier_embedding=use_fourier_embedding,
+            context_len=context_len,
+            fourier_terms=fourier_terms,
+            fourier_sigma=fourier_sigma,
+            latent_dim_rank=mla_dim_rank,
+            dropout=attn_dropout,
+            softcap=softcap,
+            learn_softmax=learn_softmax,
+            softmax_bias=softmax_bias,
+            softmax_scale_init=softmax_scale_init,
+        )
 
         hidden_dim = int(d_model * mlp_ratio)
         self.mlp = SwiGLUMlp(
@@ -165,13 +177,13 @@ class MMDitBlock(nn.Module):
         x_normed = self.self_norm(x) * (
             1 + scale_msa.unsqueeze(1)
         ) + shift_msa.unsqueeze(1)
-        attn_out = self.self_attention(x_normed, x_normed, x_normed)[0]
+        attn_out = self.self_attention(x_normed, x_normed)
         x = x + gate_msa.unsqueeze(1) * attn_out
 
         x_normed = self.cross_norm(x) * (
             1 + scale_mca.unsqueeze(1)
         ) + shift_mca.unsqueeze(1)
-        attn_out = self.cross_attention(x_normed, c, c)[0]
+        attn_out = self.cross_attention(x_normed, c)
         x = x + gate_mca.unsqueeze(1) * attn_out
 
         x = x + self.mlp(self.ffn_norm(x))
@@ -183,19 +195,26 @@ class MMDiT(nn.Module):
         self,
         d_model: int = 768,
         depth: int = 32,
+        context_depth: int = 4,
         context_len: int = 4096,
         in_channels: int = 6,
         mlp_ratio: float = 6.0,
         dac_codebooks: int = 18,
         dac_vocab: int = 1024,  # [0, 1023]
-        n_heads: int = 12,
-        n_kv_heads: int = 6,
-        use_mla: bool = True,
+        n_heads: int = 16,
+        n_kv_heads: int = 8,
+        softcap: float = 20.0,
         mla_dim_rank: int = 32,
         fourier_terms: int = 4,
         fourier_sigma: float = 0.1,
         dropout: float = 0.1,
+        learn_softmax: bool = True,
+        softmax_bias: bool = False,
+        softmax_scale_init: float = 0.43,
         use_smooth_swiglu: bool = False,
+        scale_rmsnorm: bool = False,
+        eps: float = 1e-8,
+        context_mlp_ratio: float = 2.0,
         activation_func: Literal["swish", "gelu", "gelu-approx"] = "swish",
         use_checkpointing: bool = True,
     ):
@@ -216,27 +235,49 @@ class MMDiT(nn.Module):
             act=activation_func,
         )
 
-        self.blocks = nn.ModuleList(
+        context_dim = int(d_model * context_mlp_ratio)
+        self.context_refiners = nn.ModuleList(
+            [
+                SwiGLUMlp(
+                    d_model,
+                    context_dim,
+                    use_smooth_swiglu=use_smooth_swiglu,
+                    act=activation_func,
+                )
+                for _ in range(context_depth)
+            ]
+        )
+
+        self.cross_blocks = nn.ModuleList(
             [
                 MMDitBlock(
                     d_model,
                     n_heads,
                     n_kv_heads,
-                    mlp_ratio,
-                    dropout,
-                    context_len,
+                    mlp_ratio=mlp_ratio,
+                    attn_dropout=dropout,
+                    context_len=context_len,
+                    softcap=softcap,
+                    learn_softmax=learn_softmax,
+                    softmax_bias=softmax_bias,
+                    softmax_scale_init=softmax_scale_init,
                     fourier_terms=fourier_terms,
                     fourier_sigma=fourier_sigma,
-                    use_mla=use_mla,
                     mla_dim_rank=mla_dim_rank,
                     use_smooth_swiglu=use_smooth_swiglu,
+                    scale_rmsnorm=scale_rmsnorm,
                     act=activation_func,
+                    eps=eps,
                 )
                 for _ in range(depth)
             ]
         )
 
-        self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.final_norm = RMSNorm(
+            d_model,
+            eps=eps,
+            elementwise_affine=scale_rmsnorm,
+        )
         self.final_proj = nn.Linear(d_model, in_channels)
         nn.init.constant_(self.final_proj.weight, 0)
         nn.init.constant_(self.final_proj.bias, 0)
@@ -245,12 +286,18 @@ class MMDiT(nn.Module):
         self, x: torch.FloatTensor, c: torch.ShortTensor, t: torch.LongTensor
     ) -> torch.FloatTensor:
         x = self.x_embedder(x.transpose(1, 2))
-        # no idea if this works with torch.compile, maybe rewrite as a for loop?
-        c_list = [emb(c[:, i, :]) for i, emb in enumerate(self.c_embedders)]
+
+        c_list = []
+        for i, emb in enumerate(self.c_embedders):
+            c_list.append(emb(c[:, i, :]))
         c = torch.stack(c_list, dim=0).sum(dim=0)
+
+        for block in self.context_refiners:
+            c = block(c)
+
         t_emb = self.t_embedder(t)
 
-        for block in self.blocks:
+        for block in self.cross_blocks:
             if self.training and self.use_checkpointing:
                 x = checkpoint(
                     block, x, c, t_emb, use_reentrant=False, determinism_check="none"

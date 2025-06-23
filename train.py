@@ -25,7 +25,14 @@ args.add_argument(
 args.add_argument(
     "-e", "--epochs", type=int, default=50, help="Number of training epochs"
 )
-args.add_argument("-lr", type=float, default=1e-4, help="Learning rate")
+args.add_argument("-lr", type=float, default=4e-4, help="Learning rate")
+args.add_argument(
+    "--learning-rate-stepping",
+    type=str,
+    choices=["epoch", "step"],
+    default="epoch",
+    help="Learning rate stepping strategy",
+)
 args.add_argument(
     "-wd", "--weight-decay", type=float, default=0.05, help="Weight decay for optimizer"
 )
@@ -74,7 +81,7 @@ args.add_argument(
     "--mla-head-dim", type=int, default=32, help="MLA head dimension rank"
 )
 args.add_argument(
-    "--dropout", type=float, default=0.1, help="Dropout rate for the model"
+    "--dropout", type=float, default=0.0, help="Dropout rate for the model"
 )
 args.add_argument(
     "-g",
@@ -82,6 +89,24 @@ args.add_argument(
     type=int,
     default=1,
     help="Gradient accumulation steps",
+)
+args.add_argument(
+    "--learn-softmax",
+    type=bool,
+    default=True,
+    help="Whether to learn a separate softmax scale",
+)
+args.add_argument(
+    "--softmax-bias",
+    type=bool,
+    default=False,
+    help="Whether to learn a separate bias for the softmax scale",
+)
+args.add_argument(
+    "--softmax",
+    type=float,
+    default=0.43,
+    help="Default scale per-head for the softmax scale",
 )
 args.add_argument("--load", type=str, default=None, help="Path to a checkpoint to load")
 
@@ -116,6 +141,7 @@ if __name__ == "__main__":
             "num_timesteps": 1000,
             "save_every": args.save_every,
             "checkpoint_dir": args.output_dir,
+            "learning_rate_stepping": args.learning_rate_stepping,
             "dataset_config": {
                 "dataset_dir": args.data_dir,
                 "context_len": args.dataset_length,
@@ -126,6 +152,10 @@ if __name__ == "__main__":
                 "n_heads": args.n_heads,
                 "n_kv_heads": args.n_kv_heads,
                 "mla_dim_rank": args.mla_head_dim,
+                "learn_softmax": args.learn_softmax,
+                "softmax_bias": args.softmax_bias,
+                "softmax_scale_init": args.softmax,
+                "softcap": 20.0,
                 "context_len": args.context_length,
                 "in_channels": 6,
                 "dac_codebooks": 18,

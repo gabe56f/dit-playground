@@ -161,20 +161,28 @@ class Trainer:
         self.model = MMDiT(use_checkpointing=True, **config["model_config"])
         self.model.to(device=self.device, dtype=self.dtype)
 
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model initialized with {total_params / 1e6:.2f}M parameters.")
+
         self.optimizer = AdaBelief8bit(
             self.model.parameters(),
             lr=config["lr"],
             weight_decay=config["weight_decay"],
             bf16_stochastic_round=True,
         )
-        self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config["epochs"], eta_min=1e-12
-        )
 
         self.noise_scheduler = FlowMatchingScheduler(
             num_train_timesteps=self.config["num_timesteps"]
         )
+
         self._setup_dataloaders()
+        T_max = config["epochs"]
+        if config["learning_rate_stepping"] == "step":
+            T_max *= len(self.train_dataloader) // config["gradient_accumulation"]
+
+        self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=T_max, eta_min=1e-12
+        )
 
         self.checkpoint_dir = Path(config["checkpoint_dir"])
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +295,8 @@ class Trainer:
             if ((step + 1) % self.config["gradient_accumulation"] == 0) or (
                 step + 1 == samples
             ):
+                if self.config["learning_rate_stepping"] == "step":
+                    self.lr_scheduler.step()
                 self.run.log(
                     {
                         "loss/total": total_loss,
@@ -294,6 +304,13 @@ class Trainer:
                         "loss/pixel": pixel_loss.detach(),
                         "step": step + epoch * samples,
                         "epoch": epoch + step / samples,
+                        **(
+                            {
+                                "lr": self.optimizer.param_groups[0]["lr"],
+                            }
+                            if self.config["learning_rate_stepping"] == "step"
+                            else {}
+                        ),
                     }
                 )
                 self._step()
@@ -307,13 +324,14 @@ class Trainer:
         for epoch in range(self.config["epochs"]):
             self._train_one_epoch(epoch)
 
-            self.lr_scheduler.step()
-            self.run.log(
-                {
-                    "step": epoch * len(self.train_dataloader),
-                    "lr": self.optimizer.param_groups[0]["lr"],
-                }
-            )
+            if self.config["learning_rate_stepping"] == "epoch":
+                self.lr_scheduler.step()
+                self.run.log(
+                    {
+                        "step": epoch * len(self.train_dataloader),
+                        "lr": self.optimizer.param_groups[0]["lr"],
+                    }
+                )
 
             if (epoch + 1) % self.config["save_every"] == 0:
                 checkpoint = {
