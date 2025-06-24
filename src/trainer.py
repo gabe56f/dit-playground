@@ -162,7 +162,12 @@ class Trainer:
         self.model.to(device=self.device, dtype=self.dtype)
 
         total_params = sum(p.numel() for p in self.model.parameters())
-        print(f"Model initialized with {total_params / 1e6:.2f}M parameters.")
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
+        print(
+            f"Model initialized with {total_params / 1e6:.2f}M parameters, of which {trainable_params / 1e6:.2f}M are trainable."
+        )
 
         self.optimizer = AdaBelief8bit(
             self.model.parameters(),
