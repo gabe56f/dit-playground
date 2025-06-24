@@ -201,13 +201,13 @@ class MMDiT(nn.Module):
         mlp_ratio: float = 6.0,
         dac_codebooks: int = 18,
         dac_vocab: int = 1024,  # [0, 1023]
-        n_heads: int = 16,
-        n_kv_heads: int = 8,
+        n_heads: int = 12,
+        n_kv_heads: int = 6,
         softcap: float = 20.0,
         mla_dim_rank: int = 32,
         fourier_terms: int = 4,
         fourier_sigma: float = 0.1,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         learn_softmax: bool = True,
         softmax_bias: bool = False,
         softmax_scale_init: float = 0.43,
@@ -225,15 +225,16 @@ class MMDiT(nn.Module):
         self.use_checkpointing = use_checkpointing
 
         self.x_embedder = nn.Linear(in_channels, d_model)
-        self.c_embedders = nn.ModuleList(
-            [nn.Embedding(dac_vocab, d_model) for _ in range(dac_codebooks)]
-        )
+        self.c_embedder = nn.Embedding(dac_vocab * dac_codebooks, d_model)
         self.t_embedder = TimestepEmbedding(
             d_model,
             mlp_ratio=mlp_ratio,
             use_smooth_swiglu=use_smooth_swiglu,
             act=activation_func,
         )
+
+        codebook_offsets = torch.arange(0, dac_codebooks) * dac_vocab
+        self.register_buffer("codebook_offsets", codebook_offsets, persistent=False)
 
         context_dim = int(d_model * context_mlp_ratio)
         self.context_refiners = nn.ModuleList(
@@ -287,10 +288,9 @@ class MMDiT(nn.Module):
     ) -> torch.FloatTensor:
         x = self.x_embedder(x.transpose(1, 2))
 
-        c_list = []
-        for i, emb in enumerate(self.c_embedders):
-            c_list.append(emb(c[:, i, :]))
-        c = torch.stack(c_list, dim=0).sum(dim=0)
+        # [codebooks, ] -> [batch (*), codebooks, length (*)]
+        c = c + self.codebook_offsets.view(1, -1, 1)
+        c = self.c_embedder(c).sum(dim=1)
 
         for block in self.context_refiners:
             c = block(c)
