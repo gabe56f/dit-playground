@@ -23,9 +23,9 @@ args.add_argument(
     help="Directory to save checkpoints",
 )
 args.add_argument(
-    "-e", "--epochs", type=int, default=50, help="Number of training epochs"
+    "-e", "--epochs", type=int, default=5, help="Number of training epochs"
 )
-args.add_argument("-lr", type=float, default=4e-4, help="Learning rate")
+args.add_argument("-lr", type=float, default=5e-5, help="Learning rate")
 args.add_argument(
     "--learning-rate-stepping",
     type=str,
@@ -164,8 +164,10 @@ if __name__ == "__main__":
                 "softmax_scale_init": args.softmax,
                 "softcap": 20.0,
                 "context_len": args.context_length,
-                "position_embedding": "fope",
-                "position_embedding_settings": {},
+                "position_embedding": "rope",
+                "position_embedding_settings": {
+                    "scaling_factor": 8.0,
+                },
                 "in_channels": 6,
                 "dac_codebooks": 18,
                 "dac_vocab": 1024,

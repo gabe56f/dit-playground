@@ -7,6 +7,7 @@ import torch.nn as nn
 from flash_attn import flash_attn_func
 
 from .fope import FourierPositionEmbedding
+from .rope import RotaryPositionEmbedding
 
 PositionEmbeddingType = Literal["rope", "fope", "none"]
 PositionEmbeddingSettings = Dict[str, Any]
@@ -91,10 +92,11 @@ class MultiheadLatentAttention(nn.Module):
                 **position_embedding_settings,
             )
         elif position_embedding == "rope":
-            pass
-            # self.emb = RotaryPositionalEmbedding(
-
-            # )
+            self.emb = RotaryPositionEmbedding(
+                d_head=self.d_head,
+                context_len=context_len,
+                **position_embedding_settings,
+            )
         else:
             self.emb = NoEmbedding()
         self.dropout = nn.Dropout(dropout)
