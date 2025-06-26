@@ -109,6 +109,13 @@ args.add_argument(
     help="Default scale per-head for the softmax scale",
 )
 args.add_argument("--load", type=str, default=None, help="Path to a checkpoint to load")
+args.add_argument(
+    "--position-embedding",
+    type=str,
+    default="fope",
+    choices=["fope", "rope", "none"],
+    help="Position embedding type",
+)
 
 
 if __name__ == "__main__":
@@ -157,6 +164,8 @@ if __name__ == "__main__":
                 "softmax_scale_init": args.softmax,
                 "softcap": 20.0,
                 "context_len": args.context_length,
+                "position_embedding": "fope",
+                "position_embedding_settings": {},
                 "in_channels": 6,
                 "dac_codebooks": 18,
                 "dac_vocab": 1024,

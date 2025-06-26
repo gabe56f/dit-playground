@@ -1,4 +1,5 @@
 import math
+from typing import Any, Dict, Literal
 
 import torch
 import torch.nn as nn
@@ -6,6 +7,19 @@ import torch.nn as nn
 from flash_attn import flash_attn_func
 
 from .fope import FourierPositionEmbedding
+
+PositionEmbeddingType = Literal["rope", "fope", "none"]
+PositionEmbeddingSettings = Dict[str, Any]
+
+
+class NoEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return q, k
 
 
 # arXiv:2502.07864
@@ -17,10 +31,9 @@ class MultiheadLatentAttention(nn.Module):
         n_kv_heads: int,
         latent_dim_rank: int,
         bias: bool = False,
-        use_fourier_embedding: bool = True,
+        position_embedding: PositionEmbeddingType = "fope",
+        position_embedding_settings: PositionEmbeddingSettings = {},
         context_len: int = None,
-        fourier_terms: int = 4,
-        fourier_sigma: float = 0.1,
         dropout: float = 0.0,
         softcap: float = 20.0,
         softmax_scale: float = None,
@@ -28,14 +41,36 @@ class MultiheadLatentAttention(nn.Module):
         learn_softmax: bool = True,
         softmax_bias: bool = False,
         softmax_scale_init: float = 0.43,
+        # arXiv:2505.15548
+        longshort: bool = True,
+        long_ratio: float = 0.3333333333333333,
+        short_range: int = 512,
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         assert n_kv_heads <= n_heads, "n_kv_heads must be less than or equal to n_heads"
         assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+        assert not longshort or (
+            long_ratio > 0 and long_ratio < 1
+        ), "long_ratio must be between 0 and 1 if longshort is True"
+        assert (
+            not longshort or (long_ratio * n_heads).is_integer()
+        ), "long_ratio * n_heads must be an integer if longshort is True"
+        assert (
+            not longshort or (long_ratio * n_kv_heads).is_integer()
+        ), "long_ratio * n_kv_heads must be an integer if longshort is True"
 
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
+
+        self.longshort = longshort
+        self.n_long_heads = int(n_heads * long_ratio) if longshort else n_heads
+        self.n_short_heads = n_heads - self.n_long_heads
+        self.n_long_kv_heads = int(n_kv_heads * long_ratio) if longshort else n_kv_heads
+        self.n_short_kv_heads = n_kv_heads - self.n_long_kv_heads
+        swh = short_range // 2
+        self.short_window = (swh, swh)
+
         self.d_head = d_model // n_heads
         ratio = n_heads // n_kv_heads
 
@@ -49,15 +84,19 @@ class MultiheadLatentAttention(nn.Module):
 
         self.w_o = nn.Linear(d_model, d_model, bias=bias)
 
-        if use_fourier_embedding:
+        if position_embedding == "fope":
             self.emb = FourierPositionEmbedding(
                 d_head=self.d_head,
                 context_len=context_len,
-                n_fourier_terms=fourier_terms,
-                fourier_sigma=fourier_sigma,
+                **position_embedding_settings,
             )
+        elif position_embedding == "rope":
+            pass
+            # self.emb = RotaryPositionalEmbedding(
+
+            # )
         else:
-            self.emb = nn.Identity()
+            self.emb = NoEmbedding()
         self.dropout = nn.Dropout(dropout)
         self.softcap = softcap
 
@@ -89,8 +128,7 @@ class MultiheadLatentAttention(nn.Module):
         k = k.view(B, L_k, self.n_kv_heads, self.d_head).transpose(1, 2)
         v = v.view(B, L_k, self.n_kv_heads, self.d_head).transpose(1, 2)
 
-        q: torch.Tensor = self.emb(q)
-        k = self.emb(k)
+        q, k = self.emb(q=q, k=k)
 
         if self.learn_softmax:
             dtype = q.dtype
@@ -106,21 +144,43 @@ class MultiheadLatentAttention(nn.Module):
 
             q = q * scale_per_head
 
-        output = flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            # Attention in gemma2 was trained using a softcap of 20, which improved
-            # long range dependencies in attention, so might as well have this in here,
-            # given its minimal performance cost.
-            softcap=self.softcap,
-            # arXiv:2501.19399
-            # Scaling softmax with a learnable scale (according to the paper mentioned above)
-            # improves performance in long sequences. Long sequences are all we have, so this
-            # is generally a good thing to have, right?
-            softmax_scale=self.scale,
-        )
+        if not self.longshort:
+            output = flash_attn_func(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                # Attention in gemma2 was trained using a softcap of 20, which improved
+                # long range dependencies in attention, so might as well have this in here,
+                # given its minimal performance cost.
+                softcap=self.softcap,
+                # arXiv:2501.19399
+                # Scaling softmax with a learnable scale (according to the paper mentioned above)
+                # improves performance in long sequences. Long sequences are all we have, so this
+                # is generally a good thing to have, right?
+                softmax_scale=self.scale,
+            )
+        else:
+            output_local = flash_attn_func(
+                q[:, : self.n_short_heads, :, :],
+                k[:, : self.n_short_kv_heads, :, :],
+                v[:, : self.n_short_kv_heads, :, :],
+                dropout_p=self.dropout.p if self.training else 0.0,
+                softcap=self.softcap,
+                softmax_scale=self.scale,
+                # Short attention heads focus on local dependencies
+                window_size=self.short_window,
+            )
+
+            output_long = flash_attn_func(
+                q[:, self.n_short_heads :, :, :],
+                k[:, self.n_short_kv_heads :, :, :],
+                v[:, self.n_short_kv_heads :, :, :],
+                dropout_p=self.dropout.p if self.training else 0.0,
+                softcap=self.softcap,
+                softmax_scale=self.scale,
+            )
+            output = torch.cat([output_local, output_long], dim=1)
 
         output = output.transpose(1, 2).contiguous().view(B, L_q, -1)
         return self.w_o(output)

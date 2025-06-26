@@ -499,10 +499,12 @@ class FourierPositionEmbedding(nn.Module):
         self,
         d_head: int,
         context_len: int,
+        base: int = 10000,
         n_fourier_terms: int = 4,
         fourier_sigma: float = 0.1,
         fourier_learnable: bool = False,
         triton_override: bool = False,
+        **_,
     ):
         super().__init__()
         if d_head % 2 != 0:
@@ -518,7 +520,7 @@ class FourierPositionEmbedding(nn.Module):
         self.context_len = context_len
         self.n_fourier_terms = n_fourier_terms
 
-        dominant_freqs = 1.0 / (10000 ** (torch.arange(0, d_head, 2).float() / d_head))
+        dominant_freqs = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
         self.register_buffer("dominant_freqs", dominant_freqs, persistent=False)
 
         fourier_freqs = torch.linspace(0, math.pi, n_fourier_terms)
@@ -613,24 +615,37 @@ class FourierPositionEmbedding(nn.Module):
         x_rotated = torch.stack((x_rotated_real, x_rotated_imag), dim=-1)
         return x_rotated.flatten(3).to(dtype=dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not TRITON_AVAILABLE or self.triton_override:
-            return self.apply_fourier_pos_emb(x)
+            return self.apply_fourier_pos_emb(q), self.apply_fourier_pos_emb(k)
 
-        B, n_heads, L, d_head_input = x.shape
+        B, n_heads, L, d_head_input = q.shape
+        _, n_kv_heads, _, _ = k.shape
         if d_head_input != self.d_head:
             raise ValueError(
                 f"Input d_head ({d_head_input}) does not match module d_head ({self.d_head})"
             )
 
-        fourier_terms_combined = self._compute_fourier_terms_triton(L, x.device)
+        fourier_terms_combined = self._compute_fourier_terms_triton(L, q.device)
 
-        x_rotated = _ApplyFourierEmbTritonFn.apply(
-            x,
+        q_rotated = _ApplyFourierEmbTritonFn.apply(
+            q,
             fourier_terms_combined,
             B,
             n_heads,
             L,
             self.d_head_half,
         )
-        return x_rotated
+
+        k_rotated = _ApplyFourierEmbTritonFn.apply(
+            k,
+            fourier_terms_combined,
+            B,
+            n_kv_heads,
+            L,
+            self.d_head_half,
+        )
+
+        return q_rotated, k_rotated
