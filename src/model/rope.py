@@ -231,9 +231,7 @@ class RotaryPositionEmbedding(nn.Module):
         self.scaling_factor = scaling_factor
         self.frequency_init = frequency_init
 
-        self.triton_fast_path = TRITON_AVAILABLE and (
-            (frequency_init != "resonance" and not self.training)
-        )
+        self.triton_fast_path = TRITON_AVAILABLE and frequency_init != "resonance"
 
         self._compute_inv_freq()
 
@@ -294,7 +292,7 @@ class RotaryPositionEmbedding(nn.Module):
             if self.extending == "linear":
                 positions = positions / self.scaling_factor
             inv_freq = self.inv_freq[None, :, None].to(x.device).expand(seq_len, -1, 1)
-            freqs = (inv_freq @ positions).transpose(1, 2)
+            freqs = (inv_freq @ positions[:, None, :]).transpose(1, 2)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos().unsqueeze(1).type_as(x)
         sin = emb.sin().unsqueeze(1).type_as(x)
