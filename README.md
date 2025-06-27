@@ -1,6 +1,7 @@
 # DiT playground
 
 Training logs for this branch available [here.](https://wandb.ai/g4be/osu-mmdit-flow)
+Beatmap encoding / decoding taken from [jaswons (Jason Won)](https://github.com/jaswon) [osu-dreamer repository.](https://github.com/jaswon/osu-dreamer/tree/main/osu_dreamer)
 
 # Usage
 
